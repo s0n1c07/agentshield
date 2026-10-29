@@ -171,10 +171,25 @@ class SQLiteAuthorizationAuthority:
                     max_quantity INTEGER NOT NULL,
                     currency TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    expires_at TEXT
+                    expires_at TEXT,
+                    daily_limit_paise INTEGER,
+                    monthly_limit_paise INTEGER,
+                    timezone TEXT
                 )
                 """
             )
+
+            for col_def in [
+                "daily_limit_paise INTEGER",
+                "monthly_limit_paise INTEGER",
+                "timezone TEXT",
+            ]:
+                try:
+                    connection.execute(
+                        f"ALTER TABLE authorizations ADD COLUMN {col_def}"
+                    )
+                except sqlite3.OperationalError:
+                    pass
 
             connection.execute(
                 """
@@ -216,9 +231,12 @@ class SQLiteAuthorizationAuthority:
                     max_quantity,
                     currency,
                     created_at,
-                    expires_at
+                    expires_at,
+                    daily_limit_paise,
+                    monthly_limit_paise,
+                    timezone
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     authorization.authorization_id,
@@ -248,6 +266,9 @@ class SQLiteAuthorizationAuthority:
                         if authorization.expires_at is not None
                         else None
                     ),
+                    authorization.daily_limit_paise,
+                    authorization.monthly_limit_paise,
+                    authorization.timezone,
                 ),
             )
 
@@ -308,7 +329,10 @@ class SQLiteAuthorizationAuthority:
                     max_quantity,
                     currency,
                     created_at,
-                    expires_at
+                    expires_at,
+                    daily_limit_paise,
+                    monthly_limit_paise,
+                    timezone
                 FROM authorizations
                 WHERE authorization_id = ?
                 """,
@@ -365,7 +389,10 @@ class SQLiteAuthorizationAuthority:
                     max_quantity,
                     currency,
                     created_at,
-                    expires_at
+                    expires_at,
+                    daily_limit_paise,
+                    monthly_limit_paise,
+                    timezone
                 FROM authorizations
                 WHERE user_id = ?
                   AND agent_id = ?
@@ -670,4 +697,19 @@ class SQLiteAuthorizationAuthority:
             currency=str(row["currency"]),
             created_at=created_at,
             expires_at=expires_at,
+            daily_limit_paise=(
+                int(row["daily_limit_paise"])
+                if "daily_limit_paise" in row.keys() and row["daily_limit_paise"] is not None
+                else None
+            ),
+            monthly_limit_paise=(
+                int(row["monthly_limit_paise"])
+                if "monthly_limit_paise" in row.keys() and row["monthly_limit_paise"] is not None
+                else None
+            ),
+            timezone=(
+                str(row["timezone"])
+                if "timezone" in row.keys() and row["timezone"] is not None
+                else "Asia/Kolkata"
+            ),
         )

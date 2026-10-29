@@ -34,6 +34,9 @@ def main() -> None:
         allowed_skus=["shoe_001"],
         max_quantity=2,
         currency="INR",
+        daily_limit_paise=1000000,
+        monthly_limit_paise=5000000,
+        timezone="Asia/Kolkata",
     )
 
     existing_authorization = authorization_authority.get(
@@ -68,6 +71,12 @@ def main() -> None:
         != authorization.currency
         or existing_authorization.expires_at
         != authorization.expires_at
+        or existing_authorization.daily_limit_paise
+        != authorization.daily_limit_paise
+        or existing_authorization.monthly_limit_paise
+        != authorization.monthly_limit_paise
+        or existing_authorization.timezone
+        != authorization.timezone
     ):
         raise RuntimeError(
             "demo-auth-001 already exists with different bounds"

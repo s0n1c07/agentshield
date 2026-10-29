@@ -89,6 +89,23 @@ class AgentAuthorization(BaseModel):
         description="Time after which the authorization is no longer valid.",
     )
 
+    daily_limit_paise: StrictInt | None = Field(
+        default=None,
+        gt=0,
+        description="Optional maximum cumulative spending permitted per calendar day in paise.",
+    )
+
+    monthly_limit_paise: StrictInt | None = Field(
+        default=None,
+        gt=0,
+        description="Optional maximum cumulative spending permitted per calendar month in paise.",
+    )
+
+    timezone: StrictStr = Field(
+        default="Asia/Kolkata",
+        description="Configurable timezone for calendar day and month spend windows.",
+    )
+
 
 class AuthorizationDecision(BaseModel):
     """

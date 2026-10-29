@@ -8,6 +8,7 @@ from application.orchestrator import AgentShieldOrchestrator
 from config import Settings
 from engine.audit import SQLiteAuditTrail
 from engine.authorization import SQLiteAuthorizationAuthority
+from engine.budget import SQLiteSpendLedger
 from engine.catalog import SQLiteCatalog
 from engine.hashing import IntentHasher
 from engine.idempotency import WALIdempotencyStore
@@ -110,6 +111,7 @@ class ApplicationContainer:
         "webhook_telemetry_store",
         "webhook_handler",
         "reconciliation_engine",
+        "spend_ledger",
     )
 
     def __init__(
@@ -126,6 +128,7 @@ class ApplicationContainer:
         webhook_telemetry_store: WebhookTelemetryStore,
         webhook_handler: RazorpayWebhookHandler,
         reconciliation_engine: ReconciliationEngine,
+        spend_ledger: SQLiteSpendLedger | None = None,
     ) -> None:
         self.settings = settings
         self.orchestrator = orchestrator
@@ -138,6 +141,7 @@ class ApplicationContainer:
         self.webhook_telemetry_store = webhook_telemetry_store
         self.webhook_handler = webhook_handler
         self.reconciliation_engine = reconciliation_engine
+        self.spend_ledger = spend_ledger
 
     @classmethod
     def from_environment(
@@ -236,11 +240,16 @@ class ApplicationContainer:
 
         policy_engine = DeterministicPolicyEngine()
 
+        spend_ledger = SQLiteSpendLedger(
+            f"{resolved_settings.database_path}.budget",
+        )
+
         reconciliation_engine = ReconciliationEngine(
             webhook_store=webhook_event_store,
             transaction_store=transaction_store,
             audit_trail=audit_trail,
             telemetry_store=webhook_telemetry_store,
+            spend_ledger=spend_ledger,
         )
 
         orchestrator = AgentShieldOrchestrator(
@@ -255,6 +264,7 @@ class ApplicationContainer:
             audit_trail=audit_trail,
             transaction_store=transaction_store,
             catalog=catalog,
+            spend_ledger=spend_ledger,
         )
 
         return cls(
@@ -269,6 +279,7 @@ class ApplicationContainer:
             webhook_telemetry_store=webhook_telemetry_store,
             webhook_handler=webhook_handler,
             reconciliation_engine=reconciliation_engine,
+            spend_ledger=spend_ledger,
         )
 
 

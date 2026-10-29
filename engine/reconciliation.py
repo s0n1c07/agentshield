@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from engine.audit import SQLiteAuditTrail
+from engine.budget import SQLiteSpendLedger
 from engine.state_machine import (
     InvalidTransactionTransition,
     TransactionStateMachine,
@@ -221,12 +222,14 @@ class ReconciliationEngine:
         state_machine: type[
             TransactionStateMachine
         ] = TransactionStateMachine,
+        spend_ledger: SQLiteSpendLedger | None = None,
     ) -> None:
         self._webhook_store = webhook_store
         self._transaction_store = transaction_store
         self._audit_trail = audit_trail
         self._telemetry_store = telemetry_store
         self._state_machine = state_machine
+        self._spend_ledger = spend_ledger
 
     def _telemetry(
         self,
@@ -485,6 +488,21 @@ class ReconciliationEngine:
             if self._transaction_store.get(transaction.transaction_id) is None:
                 self._transaction_store.create(transaction)
             self._transaction_store.update(updated_transaction)
+
+        if self._spend_ledger is not None:
+            if next_state == TransactionState.SUCCESS:
+                self._spend_ledger.consume(transaction.transaction_id)
+                self._audit(
+                    event_type=AuditEventType.BUDGET_CONSUMED,
+                    transaction=updated_transaction,
+                )
+            elif next_state == TransactionState.FAILED_SAFE_TO_RETRY:
+                self._spend_ledger.release(transaction.transaction_id)
+                self._audit(
+                    event_type=AuditEventType.BUDGET_RELEASED,
+                    transaction=updated_transaction,
+                    details={"reason": "payment_failed_reconciliation"},
+                )
 
         self._telemetry(
             event_type=(

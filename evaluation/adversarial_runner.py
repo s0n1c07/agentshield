@@ -10,6 +10,7 @@ from application.orchestrator import (
     OrchestrationError,
 )
 from engine.audit import SQLiteAuditTrail
+from engine.budget import SQLiteSpendLedger
 from engine.catalog import SQLiteCatalog
 from engine.hashing import IntentHasher
 from engine.idempotency import WALIdempotencyStore
@@ -183,6 +184,7 @@ def _server_authorization(
 ) -> AgentAuthorization:
     active = scenario.scenario_id != "inactive_authorization"
     revoked = scenario.scenario_id == "revoked_authorization"
+    daily_limit = 300000 if "budget" in scenario.scenario_id else 1000000
 
     return AgentAuthorization(
         user_id="user_123",
@@ -191,6 +193,7 @@ def _server_authorization(
         active=active,
         revoked=revoked,
         max_amount_paise=500000,
+        daily_limit_paise=daily_limit,
         allowed_merchants=["merchant_001"],
         allowed_categories=["footwear"],
         allowed_skus=["shoe_001"],
@@ -298,6 +301,7 @@ def _build_orchestrator(
         ),
         audit_trail=audit_trail,
         transaction_store=transaction_store,
+        spend_ledger=SQLiteSpendLedger(directory / "budget.db"),
     )
 
     return (
@@ -361,6 +365,8 @@ async def run_scenario(
 
             authorization_rejected = (
                 "authorization rejected" in exception_text
+                or "Budget limit exceeded" in exception_text
+                or "Authorization" in exception_text
             )
 
             policy_rejected = (

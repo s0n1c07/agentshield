@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from engine.audit import SQLiteAuditTrail
+from engine.budget import SQLiteSpendLedger
 from engine.catalog import SQLiteCatalog
 from engine.hashing import IntentHasher
 from engine.idempotency import WALIdempotencyStore
@@ -79,6 +80,7 @@ class AgentShieldOrchestrator:
             TransactionStateMachine
         ] = TransactionStateMachine,
         catalog: SQLiteCatalog,
+        spend_ledger: SQLiteSpendLedger | None = None,
     ) -> None:
         # Provider-neutral dependency is authoritative.
         # "claude" remains as a temporary compatibility alias for
@@ -103,6 +105,7 @@ class AgentShieldOrchestrator:
         self._audit_trail = audit_trail
         self._transaction_store = transaction_store
         self._catalog = catalog
+        self._spend_ledger = spend_ledger
 
     def _audit(
         self,
@@ -396,6 +399,44 @@ class AgentShieldOrchestrator:
             transaction=transaction,
         )
 
+        # 7b. Revalidate authorization before external dispatch
+        revalidation = self._authorization_check(analysis)
+        if not revalidation.decision.allowed or revalidation.authorization is None:
+            self._audit(
+                event_type=AuditEventType.AUTHORIZATION_REJECTED,
+                transaction=transaction,
+                details={
+                    "stage": "pre_dispatch_revalidation",
+                    "reason": revalidation.decision.reason,
+                },
+            )
+            raise OrchestrationError(
+                f"Authorization revalidation failed before dispatch: {revalidation.decision.reason}"
+            )
+
+        # 7c. Atomic Cumulative Budget Reservation (Extension 1)
+        if self._spend_ledger is not None:
+            reserved, budget_reason = self._spend_ledger.reserve(
+                transaction_id=transaction.transaction_id,
+                authorization=server_authorization,
+                amount_paise=transaction.amount_paise,
+            )
+            if not reserved:
+                self._audit(
+                    event_type=AuditEventType.BUDGET_REJECTED,
+                    transaction=transaction,
+                    details={"reason": budget_reason},
+                )
+                raise OrchestrationError(
+                    f"Budget limit exceeded: {budget_reason}"
+                )
+
+            self._audit(
+                event_type=AuditEventType.BUDGET_RESERVED,
+                transaction=transaction,
+                details={"amount_paise": transaction.amount_paise},
+            )
+
         # 8. Idempotency / execution lock
 
         acquired = self._idempotency_store.acquire(
@@ -404,6 +445,15 @@ class AgentShieldOrchestrator:
         )
 
         if not acquired:
+            # Compensating release if budget reservation was acquired
+            if self._spend_ledger is not None:
+                self._spend_ledger.release(transaction_id)
+                self._audit(
+                    event_type=AuditEventType.BUDGET_RELEASED,
+                    transaction=transaction,
+                    details={"reason": "idempotency_acquisition_failed"},
+                )
+
             self._audit(
                 event_type=AuditEventType.IDEMPOTENCY_REJECTED,
                 transaction=transaction,
@@ -473,18 +523,24 @@ class AgentShieldOrchestrator:
         # 10. Verify Razorpay order response
 
         if order.amount_paise != transaction.amount_paise:
+            if self._spend_ledger is not None:
+                self._spend_ledger.release(transaction.transaction_id)
             raise OrchestrationError(
                 "Razorpay order amount does not match "
                 "the governed transaction"
             )
 
         if order.currency != transaction.currency:
+            if self._spend_ledger is not None:
+                self._spend_ledger.release(transaction.transaction_id)
             raise OrchestrationError(
                 "Razorpay order currency does not match "
                 "the governed transaction"
             )
 
         if order.status != "created":
+            if self._spend_ledger is not None:
+                self._spend_ledger.release(transaction.transaction_id)
             raise OrchestrationError(
                 "Razorpay order status is not created"
             )
