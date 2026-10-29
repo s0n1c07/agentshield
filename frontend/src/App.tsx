@@ -503,6 +503,9 @@ async function fetchAuditTrail(
     throw new Error(detail)
   }
 
+  return body as AuditEvent[]
+}
+
 async function approvePendingTransaction(
   transactionId: string,
 ): Promise<TransactionRecord> {
