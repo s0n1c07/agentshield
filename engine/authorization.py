@@ -174,7 +174,8 @@ class SQLiteAuthorizationAuthority:
                     expires_at TEXT,
                     daily_limit_paise INTEGER,
                     monthly_limit_paise INTEGER,
-                    timezone TEXT
+                    timezone TEXT,
+                    approval_threshold_paise INTEGER
                 )
                 """
             )
@@ -183,6 +184,7 @@ class SQLiteAuthorizationAuthority:
                 "daily_limit_paise INTEGER",
                 "monthly_limit_paise INTEGER",
                 "timezone TEXT",
+                "approval_threshold_paise INTEGER",
             ]:
                 try:
                     connection.execute(
@@ -234,9 +236,10 @@ class SQLiteAuthorizationAuthority:
                     expires_at,
                     daily_limit_paise,
                     monthly_limit_paise,
-                    timezone
+                    timezone,
+                    approval_threshold_paise
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     authorization.authorization_id,
@@ -269,6 +272,7 @@ class SQLiteAuthorizationAuthority:
                     authorization.daily_limit_paise,
                     authorization.monthly_limit_paise,
                     authorization.timezone,
+                    authorization.approval_threshold_paise,
                 ),
             )
 
@@ -332,7 +336,8 @@ class SQLiteAuthorizationAuthority:
                     expires_at,
                     daily_limit_paise,
                     monthly_limit_paise,
-                    timezone
+                    timezone,
+                    approval_threshold_paise
                 FROM authorizations
                 WHERE authorization_id = ?
                 """,
@@ -392,7 +397,8 @@ class SQLiteAuthorizationAuthority:
                     expires_at,
                     daily_limit_paise,
                     monthly_limit_paise,
-                    timezone
+                    timezone,
+                    approval_threshold_paise
                 FROM authorizations
                 WHERE user_id = ?
                   AND agent_id = ?
@@ -711,5 +717,10 @@ class SQLiteAuthorizationAuthority:
                 str(row["timezone"])
                 if "timezone" in row.keys() and row["timezone"] is not None
                 else "Asia/Kolkata"
+            ),
+            approval_threshold_paise=(
+                int(row["approval_threshold_paise"])
+                if "approval_threshold_paise" in row.keys() and row["approval_threshold_paise"] is not None
+                else None
             ),
         )

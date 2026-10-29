@@ -503,7 +503,82 @@ async function fetchAuditTrail(
     throw new Error(detail)
   }
 
-  return body as AuditEvent[]
+async function approvePendingTransaction(
+  transactionId: string,
+): Promise<TransactionRecord> {
+  const token =
+    import.meta.env.VITE_AGENTSHIELD_APPROVER_TOKEN ||
+    import.meta.env.VITE_AGENTSHIELD_API_TOKEN
+
+  if (!token) {
+    throw new Error('Approver token is not configured.')
+  }
+
+  const response = await fetch(
+    `/v1/transactions/${encodeURIComponent(transactionId)}/approve`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ reason: 'Approved via dashboard' }),
+    },
+  )
+
+  const body = await response.json().catch(() => null)
+
+  if (!response.ok) {
+    const detail =
+      body &&
+      typeof body === 'object' &&
+      'detail' in body &&
+      typeof body.detail === 'string'
+        ? body.detail
+        : `Approval failed with HTTP ${response.status}.`
+    throw new Error(detail)
+  }
+
+  return body as TransactionRecord
+}
+
+async function rejectPendingTransaction(
+  transactionId: string,
+): Promise<TransactionRecord> {
+  const token =
+    import.meta.env.VITE_AGENTSHIELD_APPROVER_TOKEN ||
+    import.meta.env.VITE_AGENTSHIELD_API_TOKEN
+
+  if (!token) {
+    throw new Error('Approver token is not configured.')
+  }
+
+  const response = await fetch(
+    `/v1/transactions/${encodeURIComponent(transactionId)}/reject`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ reason: 'Rejected via dashboard' }),
+    },
+  )
+
+  const body = await response.json().catch(() => null)
+
+  if (!response.ok) {
+    const detail =
+      body &&
+      typeof body === 'object' &&
+      'detail' in body &&
+      typeof body.detail === 'string'
+        ? body.detail
+        : `Rejection failed with HTTP ${response.status}.`
+    throw new Error(detail)
+  }
+
+  return body as TransactionRecord
 }
 
 function App() {
@@ -557,10 +632,16 @@ function App() {
   const decision = error
     ? 'BLOCKED'
     : result
-      ? result.status === 'SUCCESS' ||
-        result.status === 'COMPLETED'
-        ? 'COMPLETED'
-        : 'APPROVED'
+      ? transaction?.state === 'PENDING_APPROVAL'
+        ? 'PENDING APPROVAL'
+        : transaction?.state === 'APPROVAL_REJECTED'
+          ? 'REJECTED'
+          : transaction?.state === 'APPROVAL_EXPIRED'
+            ? 'EXPIRED'
+            : result.status === 'SUCCESS' ||
+              result.status === 'COMPLETED'
+              ? 'COMPLETED'
+              : 'APPROVED'
       : 'READY'
 
   const runScenario = async () => {
@@ -592,6 +673,74 @@ function App() {
         err instanceof Error
           ? err.message
           : 'AgentShield execution failed.',
+      )
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleApprove = async () => {
+    if (!transaction) return
+    setLoading(true)
+    setError(null)
+    try {
+      const updatedTx = await approvePendingTransaction(
+        transaction.transaction_id,
+      )
+      setResult((prev) =>
+        prev
+          ? {
+              ...prev,
+              transaction: updatedTx,
+              status: updatedTx.state,
+            }
+          : null,
+      )
+      try {
+        const events = await fetchAuditTrail(
+          transaction.transaction_id,
+        )
+        setAuditEvents(events)
+      } catch (e) {
+        console.warn('Audit refresh failed:', e)
+      }
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : 'Approval failed',
+      )
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleReject = async () => {
+    if (!transaction) return
+    setLoading(true)
+    setError(null)
+    try {
+      const updatedTx = await rejectPendingTransaction(
+        transaction.transaction_id,
+      )
+      setResult((prev) =>
+        prev
+          ? {
+              ...prev,
+              transaction: updatedTx,
+              status: updatedTx.state,
+            }
+          : null,
+      )
+      try {
+        const events = await fetchAuditTrail(
+          transaction.transaction_id,
+        )
+        setAuditEvents(events)
+      } catch (e) {
+        console.warn('Audit refresh failed:', e)
+      }
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : 'Rejection failed',
       )
     } finally {
       setLoading(false)
@@ -694,6 +843,82 @@ function App() {
             )}</strong>
           </div>
         </section>
+
+        {transaction?.state === 'PENDING_APPROVAL' && (
+          <section
+            style={{
+              marginTop: '1.25rem',
+              padding: '1.5rem',
+              borderRadius: '12px',
+              border: '1px solid #f59e0b',
+              background: 'rgba(245, 158, 11, 0.08)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: '1rem',
+              flexWrap: 'wrap',
+            }}
+          >
+            <div>
+              <div
+                style={{
+                  fontSize: '0.75rem',
+                  fontWeight: 700,
+                  letterSpacing: '0.08em',
+                  color: '#f59e0b',
+                  marginBottom: '0.25rem',
+                }}
+              >
+                HUMAN APPROVAL REQUIRED
+              </div>
+              <div
+                style={{
+                  fontSize: '1rem',
+                  fontWeight: 600,
+                  color: '#ffffff',
+                }}
+              >
+                Amount exceeds automatic authorization threshold
+              </div>
+              <div
+                style={{
+                  fontSize: '0.85rem',
+                  color: '#94a3b8',
+                  marginTop: '0.25rem',
+                }}
+              >
+                A human approver token is required to authorize money movement and dispatch to payment rail.
+              </div>
+            </div>
+
+            <div style={{ display: 'flex', gap: '0.75rem' }}>
+              <button
+                type="button"
+                className="secondary-button"
+                style={{
+                  borderColor: '#ef4444',
+                  color: '#ef4444',
+                }}
+                disabled={loading}
+                onClick={handleReject}
+              >
+                {loading ? 'Processing...' : 'Reject Payment'}
+              </button>
+              <button
+                type="button"
+                className="primary-button"
+                style={{
+                  background: '#10b981',
+                  borderColor: '#10b981',
+                }}
+                disabled={loading}
+                onClick={handleApprove}
+              >
+                {loading ? 'Processing...' : 'Approve Payment'}
+              </button>
+            </div>
+          </section>
+        )}
 
         <section className="overview-grid">
           <article className="card request-card">

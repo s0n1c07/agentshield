@@ -104,6 +104,8 @@ class Settings(BaseModel):
     api_token: StrictStr
     api_user_id: StrictStr
     api_agent_id: StrictStr
+    approver_token: StrictStr = Field(default="agentshield-approver-token-secret-fallback-32chars")
+    approval_ttl_seconds: StrictInt = Field(default=900, gt=0)
 
     @model_validator(mode="before")
     @classmethod
@@ -268,4 +270,12 @@ class Settings(BaseModel):
             api_token=api_token,
             api_user_id=api_user_id,
             api_agent_id=api_agent_id,
+            approver_token=os.getenv(
+                "AGENTSHIELD_APPROVER_TOKEN",
+                "agentshield-approver-token-secret-fallback-32chars",
+            ).strip(),
+            approval_ttl_seconds=_positive_int(
+                "AGENTSHIELD_APPROVAL_TTL_SECONDS",
+                900,
+            ),
         )

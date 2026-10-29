@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from engine.approval import SQLiteApprovalStore
 from engine.audit import SQLiteAuditTrail
 from engine.budget import SQLiteSpendLedger
 from engine.catalog import SQLiteCatalog
@@ -21,9 +22,14 @@ from integrations.razorpay import (
     RazorpayClient,
     RazorpayNetworkError,
 )
+from models.approval import ApprovalRecord, ApprovalStatus
 from models.audit import AuditEventType
-from models.authorization import AuthorizationEvaluation
-from models.intent import AgentRequestAnalysis
+from models.authorization import AgentAuthorization, AuthorizationEvaluation
+from models.intent import (
+    AgentRequestAnalysis,
+    AuthorizationInterpretation,
+    IntentProposal,
+)
 from models.mandate import Mandate
 from models.orchestration import OrchestrationResult
 from models.policy import (
@@ -81,6 +87,8 @@ class AgentShieldOrchestrator:
         ] = TransactionStateMachine,
         catalog: SQLiteCatalog,
         spend_ledger: SQLiteSpendLedger | None = None,
+        approval_store: SQLiteApprovalStore | None = None,
+        approval_ttl_seconds: int = 900,
     ) -> None:
         # Provider-neutral dependency is authoritative.
         # "claude" remains as a temporary compatibility alias for
@@ -106,6 +114,8 @@ class AgentShieldOrchestrator:
         self._transaction_store = transaction_store
         self._catalog = catalog
         self._spend_ledger = spend_ledger
+        self._approval_store = approval_store
+        self._approval_ttl_seconds = approval_ttl_seconds
 
     def _audit(
         self,
@@ -191,6 +201,10 @@ class AgentShieldOrchestrator:
         existing_transaction = self._transaction_store.get(
             transaction_id
         )
+        if existing_transaction is None:
+            existing_transaction = self._transaction_store.get_by_idempotency_key(
+                idempotency_key
+            )
 
         transaction = TransactionRecord(
             transaction_id=transaction_id,
@@ -207,6 +221,14 @@ class AgentShieldOrchestrator:
         )
 
         if existing_transaction is not None:
+            # If already pending approval, return pending status (idempotent polling)
+            if existing_transaction.state == TransactionState.PENDING_APPROVAL:
+                return OrchestrationResult(
+                    transaction=existing_transaction,
+                    mandate=None,
+                    status="PENDING_APPROVAL",
+                )
+
             self._assert_existing_transaction_matches(
                 existing=existing_transaction,
                 candidate=transaction,
@@ -362,6 +384,50 @@ class AgentShieldOrchestrator:
         )
         self._transaction_store.update(transaction)
 
+        # Check approval threshold (Extension 2)
+        if (
+            server_authorization.approval_threshold_paise is not None
+            and transaction.amount_paise >= server_authorization.approval_threshold_paise
+        ):
+            transaction = self._transition(
+                transaction,
+                TransactionState.PENDING_APPROVAL,
+            )
+            self._transaction_store.update(transaction)
+
+            if self._approval_store is not None:
+                expires_at = datetime.now(timezone.utc) + timedelta(
+                    seconds=self._approval_ttl_seconds
+                )
+                approval_record = ApprovalRecord(
+                    transaction_id=transaction.transaction_id,
+                    intent_hash=intent_hash,
+                    user_id=transaction.user_id,
+                    agent_id=transaction.agent_id,
+                    amount_paise=transaction.amount_paise,
+                    currency=transaction.currency,
+                    merchant_name=transaction.merchant_id,
+                    status=ApprovalStatus.PENDING,
+                    expires_at=expires_at,
+                )
+                self._approval_store.create(approval_record)
+
+            self._audit(
+                event_type=AuditEventType.APPROVAL_REQUESTED,
+                transaction=transaction,
+                details={
+                    "threshold_paise": server_authorization.approval_threshold_paise,
+                    "amount_paise": transaction.amount_paise,
+                    "intent_hash": intent_hash,
+                },
+            )
+
+            return OrchestrationResult(
+                transaction=transaction,
+                mandate=None,
+                status="PENDING_APPROVAL",
+            )
+
         # 7. Create and verify mandate
 
         mandate = self._mandate_engine.create(
@@ -399,7 +465,29 @@ class AgentShieldOrchestrator:
             transaction=transaction,
         )
 
-        # 7b. Revalidate authorization before external dispatch
+        # 8-12. Dispatch and complete
+        transaction = await self._dispatch_and_complete(
+            transaction=transaction,
+            server_authorization=server_authorization,
+            idempotency_key=idempotency_key,
+            analysis=analysis,
+        )
+
+        return OrchestrationResult(
+            transaction=transaction,
+            mandate=mandate,
+            status="DISPATCHED",
+        )
+
+    async def _dispatch_and_complete(
+        self,
+        *,
+        transaction: TransactionRecord,
+        server_authorization: AgentAuthorization,
+        idempotency_key: str,
+        analysis: AgentRequestAnalysis,
+    ) -> TransactionRecord:
+        # Revalidate authorization before external dispatch
         revalidation = self._authorization_check(analysis)
         if not revalidation.decision.allowed or revalidation.authorization is None:
             self._audit(
@@ -414,7 +502,7 @@ class AgentShieldOrchestrator:
                 f"Authorization revalidation failed before dispatch: {revalidation.decision.reason}"
             )
 
-        # 7c. Atomic Cumulative Budget Reservation (Extension 1)
+        # Atomic Cumulative Budget Reservation (Extension 1)
         if self._spend_ledger is not None:
             reserved, budget_reason = self._spend_ledger.reserve(
                 transaction_id=transaction.transaction_id,
@@ -437,17 +525,16 @@ class AgentShieldOrchestrator:
                 details={"amount_paise": transaction.amount_paise},
             )
 
-        # 8. Idempotency / execution lock
-
+        # Idempotency / execution lock
         acquired = self._idempotency_store.acquire(
             idempotency_key=idempotency_key,
-            transaction_id=transaction_id,
+            transaction_id=transaction.transaction_id,
         )
 
         if not acquired:
             # Compensating release if budget reservation was acquired
             if self._spend_ledger is not None:
-                self._spend_ledger.release(transaction_id)
+                self._spend_ledger.release(transaction.transaction_id)
                 self._audit(
                     event_type=AuditEventType.BUDGET_RELEASED,
                     transaction=transaction,
@@ -474,8 +561,7 @@ class AgentShieldOrchestrator:
         )
         self._transaction_store.update(transaction)
 
-        # 9. Dispatch to Razorpay
-
+        # Dispatch to Razorpay
         try:
             order = await self._razorpay.create_order(
                 amount_paise=transaction.amount_paise,
@@ -520,8 +606,7 @@ class AgentShieldOrchestrator:
                 "Razorpay outcome is unknown after dispatch failure"
             ) from exc
 
-        # 10. Verify Razorpay order response
-
+        # Verify Razorpay order response
         if order.amount_paise != transaction.amount_paise:
             if self._spend_ledger is not None:
                 self._spend_ledger.release(transaction.transaction_id)
@@ -545,8 +630,7 @@ class AgentShieldOrchestrator:
                 "Razorpay order status is not created"
             )
 
-        # 11. Record Razorpay order
-
+        # Record Razorpay order
         transaction = transaction.model_copy(
             update={
                 "razorpay_order_id": order.order_id,
@@ -555,8 +639,7 @@ class AgentShieldOrchestrator:
         )
         self._transaction_store.update(transaction)
 
-        # 12. LOCK_ACQUIRED → DISPATCHED
-
+        # LOCK_ACQUIRED → DISPATCHED
         transaction = self._transition(
             transaction,
             TransactionState.DISPATCHED,
@@ -573,11 +656,230 @@ class AgentShieldOrchestrator:
             },
         )
 
-        return OrchestrationResult(
-            transaction=transaction,
-            mandate=mandate,
-            status="DISPATCHED",
+        return transaction
+
+    async def approve_transaction(
+        self,
+        *,
+        transaction_id: str,
+        approver_principal: str,
+        reason: str | None = None,
+    ) -> TransactionRecord:
+        """
+        Approve a transaction paused in PENDING_APPROVAL.
+        Re-verifies authorization, re-evaluates policy/catalog, creates Ed25519 mandate,
+        reserves budget, acquires idempotency, and dispatches to Razorpay.
+        """
+        transaction = self._transaction_store.get(transaction_id)
+        if transaction is None:
+            raise OrchestrationError("Transaction not found")
+
+        if transaction.state != TransactionState.PENDING_APPROVAL:
+            raise OrchestrationError(
+                f"Transaction is not pending approval (state={transaction.state.value})"
+            )
+
+        # Check approval record TTL and intent binding
+        if self._approval_store is not None:
+            approval = self._approval_store.get(transaction_id)
+            if approval is None:
+                raise OrchestrationError("Approval record not found")
+
+            now = datetime.now(timezone.utc)
+            if approval.status == ApprovalStatus.EXPIRED or now >= approval.expires_at:
+                transaction = self._transition(
+                    transaction,
+                    TransactionState.APPROVAL_EXPIRED,
+                )
+                self._transaction_store.update(transaction)
+                self._audit(
+                    event_type=AuditEventType.APPROVAL_EXPIRED,
+                    transaction=transaction,
+                    details={"reason": "Approval request has expired"},
+                )
+                raise OrchestrationError("Approval request has expired")
+
+            if approval.status != ApprovalStatus.PENDING:
+                raise OrchestrationError(
+                    f"Approval request is already {approval.status.value}"
+                )
+
+            if approval.intent_hash != transaction.intent_hash:
+                raise OrchestrationError(
+                    "Approval record intent hash does not match transaction intent hash"
+                )
+
+        # Re-verify authorization at moment of approval (TOCTOU defense)
+        auth_interp = AuthorizationInterpretation(
+            max_amount_paise=transaction.amount_paise,
+            currency=transaction.currency,
+            product_constraints=[],
+            allowed_merchants=[transaction.merchant_id],
+            max_quantity=sum(item.quantity for item in transaction.items),
+            constraints=[],
         )
+        proposal = IntentProposal(
+            user_id=transaction.user_id,
+            agent_id=transaction.agent_id,
+            intent_id=transaction.intent_id,
+            raw_user_prompt="Human approved transaction",
+            merchant_id=transaction.merchant_id,
+            amount_paise=transaction.amount_paise,
+            currency=transaction.currency,
+            items=transaction.items,
+            action_type="CREATE_ORDER",
+            nonce=f"nonce_{transaction.transaction_id}",
+            created_at=datetime.now(timezone.utc),
+            ttl_seconds=300,
+        )
+        analysis = AgentRequestAnalysis(
+            raw_user_prompt="Human approved transaction",
+            authorization=auth_interp,
+            intent_proposal=proposal,
+        )
+
+        revalidation = self._authorization_check(analysis)
+        if not revalidation.decision.allowed or revalidation.authorization is None:
+            self._audit(
+                event_type=AuditEventType.AUTHORIZATION_REJECTED,
+                transaction=transaction,
+                details={
+                    "stage": "approval_revalidation",
+                    "reason": revalidation.decision.reason,
+                },
+            )
+            raise OrchestrationError(
+                f"Authorization revalidation failed upon approval: {revalidation.decision.reason}"
+            )
+
+        server_authorization = revalidation.authorization
+
+        # Intent binding: ensure hash matches revalidated authorization
+        current_intent_hash = self._intent_hasher.hash(
+            server_authorization,
+            proposal,
+        )
+        if current_intent_hash != transaction.intent_hash:
+            raise OrchestrationError(
+                "Intent hash mismatch after authorization revalidation"
+            )
+
+        # Re-evaluate policy and catalog
+        policy = self._policy_provider(analysis)
+        policy_result = self._policy_engine.evaluate(
+            proposal,
+            server_authorization,
+            policy,
+            catalog=self._catalog,
+        )
+        if not policy_result.allowed:
+            self._audit(
+                event_type=AuditEventType.POLICY_REJECTED,
+                transaction=transaction,
+                details={"reason": policy_result.reason},
+            )
+            raise OrchestrationError(
+                f"Policy rejected transaction upon approval: {policy_result.reason}"
+            )
+
+        # Record decision in approval store
+        if self._approval_store is not None:
+            self._approval_store.decide(
+                transaction_id=transaction_id,
+                status=ApprovalStatus.APPROVED,
+                decided_by=approver_principal,
+                reason=reason,
+            )
+
+        self._audit(
+            event_type=AuditEventType.APPROVAL_APPROVED,
+            transaction=transaction,
+            details={
+                "decided_by": approver_principal,
+                "reason": reason,
+            },
+        )
+
+        # Create and verify Ed25519 mandate
+        mandate = self._mandate_engine.create(
+            authorization=server_authorization,
+            proposal=proposal,
+        )
+        self._audit(
+            event_type=AuditEventType.MANDATE_CREATED,
+            transaction=transaction,
+            details={"expires_at": mandate.expires_at.isoformat()},
+        )
+        mandate_valid = self._mandate_engine.verify(
+            mandate=mandate,
+            authorization=server_authorization,
+            proposal=proposal,
+        )
+        if not mandate_valid:
+            raise OrchestrationError("Mandate verification failed")
+
+        transaction = self._transition(
+            transaction,
+            TransactionState.MANDATE_VALID,
+        )
+        self._transaction_store.update(transaction)
+        self._audit(
+            event_type=AuditEventType.MANDATE_VERIFIED,
+            transaction=transaction,
+        )
+
+        # Dispatch and complete
+        return await self._dispatch_and_complete(
+            transaction=transaction,
+            server_authorization=server_authorization,
+            idempotency_key=transaction.idempotency_key,
+            analysis=analysis,
+        )
+
+    def reject_transaction(
+        self,
+        *,
+        transaction_id: str,
+        approver_principal: str,
+        reason: str | None = None,
+    ) -> TransactionRecord:
+        """
+        Reject a transaction paused in PENDING_APPROVAL.
+        Transitions state to APPROVAL_REJECTED and records audit trail.
+        """
+        transaction = self._transaction_store.get(transaction_id)
+        if transaction is None:
+            raise OrchestrationError("Transaction not found")
+
+        if transaction.state != TransactionState.PENDING_APPROVAL:
+            raise OrchestrationError(
+                f"Transaction is not pending approval (state={transaction.state.value})"
+            )
+
+        if self._approval_store is not None:
+            self._approval_store.decide(
+                transaction_id=transaction_id,
+                status=ApprovalStatus.REJECTED,
+                decided_by=approver_principal,
+                reason=reason,
+            )
+
+        transaction = self._transition(
+            transaction,
+            TransactionState.APPROVAL_REJECTED,
+        )
+        self._transaction_store.update(transaction)
+
+        self._audit(
+            event_type=AuditEventType.APPROVAL_REJECTED,
+            transaction=transaction,
+            details={
+                "decided_by": approver_principal,
+                "reason": reason,
+            },
+        )
+
+        return transaction
 
     def _transition(
         self,

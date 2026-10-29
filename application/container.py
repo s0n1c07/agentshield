@@ -5,7 +5,7 @@ from collections.abc import Callable
 from groq import Groq
 
 from application.orchestrator import AgentShieldOrchestrator
-from config import Settings
+from engine.approval import SQLiteApprovalStore
 from engine.audit import SQLiteAuditTrail
 from engine.authorization import SQLiteAuthorizationAuthority
 from engine.budget import SQLiteSpendLedger
@@ -112,6 +112,7 @@ class ApplicationContainer:
         "webhook_handler",
         "reconciliation_engine",
         "spend_ledger",
+        "approval_store",
     )
 
     def __init__(
@@ -129,6 +130,7 @@ class ApplicationContainer:
         webhook_handler: RazorpayWebhookHandler,
         reconciliation_engine: ReconciliationEngine,
         spend_ledger: SQLiteSpendLedger | None = None,
+        approval_store: SQLiteApprovalStore | None = None,
     ) -> None:
         self.settings = settings
         self.orchestrator = orchestrator
@@ -142,6 +144,7 @@ class ApplicationContainer:
         self.webhook_handler = webhook_handler
         self.reconciliation_engine = reconciliation_engine
         self.spend_ledger = spend_ledger
+        self.approval_store = approval_store
 
     @classmethod
     def from_environment(
@@ -244,6 +247,10 @@ class ApplicationContainer:
             f"{resolved_settings.database_path}.budget",
         )
 
+        approval_store = SQLiteApprovalStore(
+            f"{resolved_settings.database_path}.approval",
+        )
+
         reconciliation_engine = ReconciliationEngine(
             webhook_store=webhook_event_store,
             transaction_store=transaction_store,
@@ -265,6 +272,8 @@ class ApplicationContainer:
             transaction_store=transaction_store,
             catalog=catalog,
             spend_ledger=spend_ledger,
+            approval_store=approval_store,
+            approval_ttl_seconds=resolved_settings.approval_ttl_seconds,
         )
 
         return cls(
@@ -280,6 +289,7 @@ class ApplicationContainer:
             webhook_handler=webhook_handler,
             reconciliation_engine=reconciliation_engine,
             spend_ledger=spend_ledger,
+            approval_store=approval_store,
         )
 
 

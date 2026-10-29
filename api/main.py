@@ -10,6 +10,7 @@ from fastapi import (
     HTTPException,
     Path,
     Request,
+    Response,
     status,
 )
 from pydantic import (
@@ -24,6 +25,7 @@ from application.orchestrator import (
     AgentShieldOrchestrator,
     OrchestrationError,
 )
+from engine.approval import SQLiteApprovalStore
 from engine.audit import SQLiteAuditTrail
 from integrations.groq import GroqRateLimitError
 from engine.reconciliation import (
@@ -36,6 +38,11 @@ from engine.telemetry import (
     WebhookTelemetryStore,
 )
 from engine.transaction_store import SQLiteTransactionStore
+from models.approval import (
+    ApprovalDecisionRequest,
+    ApprovalRecord,
+    ApprovalStatus,
+)
 from models.audit import AuditEvent
 from models.orchestration import OrchestrationResult
 from models.transaction import (
@@ -47,6 +54,8 @@ from webhooks.razorpay import RazorpayWebhookHandler
 from .dependencies import (
     AuthenticatedPrincipal,
     configure_app,
+    get_approval_store,
+    get_authenticated_approver,
     get_authenticated_principal,
     get_audit_trail,
     get_orchestrator,
@@ -118,9 +127,11 @@ class AgentShieldAPI:
                 audit_trail=container.audit_trail,
                 webhook_handler=container.webhook_handler,
                 reconciliation_engine=container.reconciliation_engine,
+                approval_store=container.approval_store,
                 api_token=container.settings.api_token,
                 api_user_id=container.settings.api_user_id,
                 api_agent_id=container.settings.api_agent_id,
+                approver_token=container.settings.approver_token,
             )
 
         self._register_routes()
@@ -141,6 +152,7 @@ class AgentShieldAPI:
         )
         async def execute_agent(
             payload: AgentExecuteRequest,
+            response: Response,
             idempotency_key: str = Header(
                 alias="Idempotency-Key",
                 min_length=1,
@@ -162,7 +174,7 @@ class AgentShieldAPI:
             transaction_id = f"txn_{uuid4().hex}"
 
             try:
-                return await orchestrator.execute(
+                result = await orchestrator.execute(
                     user_message=payload.user_message,
                     user_id=principal.user_id,
                     agent_id=principal.agent_id,
@@ -171,6 +183,9 @@ class AgentShieldAPI:
                     idempotency_key=idempotency_key,
                     merchant_context=payload.merchant_context,
                 )
+                if result.transaction.state == TransactionState.PENDING_APPROVAL:
+                    response.status_code = status.HTTP_202_ACCEPTED
+                return result
             except OrchestrationError as exc:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
@@ -369,6 +384,98 @@ class AgentShieldAPI:
             return audit_trail.list_events(
                 transaction_id=transaction_id
             )
+
+        @self.app.get(
+            "/v1/approvals",
+            response_model=list[ApprovalRecord],
+            status_code=status.HTTP_200_OK,
+        )
+        async def list_approvals(
+            status_filter: str | None = None,
+            status: str | None = None,
+            approver: AuthenticatedPrincipal = Depends(
+                get_authenticated_approver
+            ),
+            approval_store: SQLiteApprovalStore = Depends(
+                get_approval_store
+            ),
+        ) -> list[ApprovalRecord]:
+            filter_val = status or status_filter
+            parsed_status = None
+            if filter_val and filter_val.strip():
+                try:
+                    parsed_status = ApprovalStatus(filter_val.strip().upper())
+                except ValueError:
+                    pass
+            return approval_store.list(status=parsed_status)
+
+        @self.app.post(
+            "/v1/transactions/{transaction_id}/approve",
+            response_model=TransactionRecord,
+            status_code=status.HTTP_200_OK,
+        )
+        async def approve_transaction(
+            transaction_id: str = Path(min_length=1),
+            payload: ApprovalDecisionRequest | None = None,
+            approver: AuthenticatedPrincipal = Depends(
+                get_authenticated_approver
+            ),
+            orchestrator: AgentShieldOrchestrator = Depends(
+                get_orchestrator
+            ),
+        ) -> TransactionRecord:
+            reason = payload.reason if payload else None
+            try:
+                return await orchestrator.approve_transaction(
+                    transaction_id=transaction_id,
+                    approver_principal=approver.user_id,
+                    reason=reason,
+                )
+            except OrchestrationError as exc:
+                err_msg = str(exc)
+                if "not found" in err_msg.lower():
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail=err_msg,
+                    ) from exc
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=err_msg,
+                ) from exc
+
+        @self.app.post(
+            "/v1/transactions/{transaction_id}/reject",
+            response_model=TransactionRecord,
+            status_code=status.HTTP_200_OK,
+        )
+        async def reject_transaction(
+            transaction_id: str = Path(min_length=1),
+            payload: ApprovalDecisionRequest | None = None,
+            approver: AuthenticatedPrincipal = Depends(
+                get_authenticated_approver
+            ),
+            orchestrator: AgentShieldOrchestrator = Depends(
+                get_orchestrator
+            ),
+        ) -> TransactionRecord:
+            reason = payload.reason if payload else None
+            try:
+                return orchestrator.reject_transaction(
+                    transaction_id=transaction_id,
+                    approver_principal=approver.user_id,
+                    reason=reason,
+                )
+            except OrchestrationError as exc:
+                err_msg = str(exc)
+                if "not found" in err_msg.lower():
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail=err_msg,
+                    ) from exc
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=err_msg,
+                ) from exc
 
 def create_app(
     container: ApplicationContainer | None = None,

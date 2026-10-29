@@ -247,6 +247,38 @@ class SQLiteTransactionStore:
         finally:
             connection.close()
 
+    def get_by_idempotency_key(
+        self,
+        idempotency_key: str,
+    ) -> TransactionRecord | None:
+        """
+        Retrieve a transaction by its idempotency key.
+        """
+        self._require_non_empty(
+            idempotency_key,
+            "idempotency_key",
+        )
+
+        connection = self._connect()
+
+        try:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM transactions
+                WHERE idempotency_key = ?
+                """,
+                (idempotency_key,),
+            ).fetchone()
+
+            if row is None:
+                return None
+
+            return self._row_to_transaction(row)
+
+        finally:
+            connection.close()
+
     def get_by_order_id(
         self,
         order_id: str,

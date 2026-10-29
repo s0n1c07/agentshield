@@ -37,6 +37,7 @@ def main() -> None:
         daily_limit_paise=1000000,
         monthly_limit_paise=5000000,
         timezone="Asia/Kolkata",
+        approval_threshold_paise=300000,
     )
 
     existing_authorization = authorization_authority.get(
@@ -77,6 +78,8 @@ def main() -> None:
         != authorization.monthly_limit_paise
         or existing_authorization.timezone
         != authorization.timezone
+        or existing_authorization.approval_threshold_paise
+        != authorization.approval_threshold_paise
     ):
         raise RuntimeError(
             "demo-auth-001 already exists with different bounds"

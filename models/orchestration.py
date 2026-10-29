@@ -20,8 +20,9 @@ class OrchestrationResult(BaseModel):
         description="Current server-owned transaction record.",
     )
 
-    mandate: Mandate = Field(
-        description="Signed mandate governing the transaction.",
+    mandate: Mandate | None = Field(
+        default=None,
+        description="Signed mandate governing the transaction, or None if awaiting approval.",
     )
 
     status: StrictStr = Field(

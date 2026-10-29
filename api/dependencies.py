@@ -5,6 +5,7 @@ import hmac
 from fastapi import FastAPI, HTTPException, Request, status
 
 from application.orchestrator import AgentShieldOrchestrator
+from engine.approval import SQLiteApprovalStore
 from engine.audit import SQLiteAuditTrail
 from engine.reconciliation import ReconciliationEngine
 from engine.telemetry import WebhookTelemetryStore
@@ -22,9 +23,11 @@ def configure_app(
     webhook_handler: RazorpayWebhookHandler | None = None,
     reconciliation_engine: ReconciliationEngine | None = None,
     webhook_telemetry_store: WebhookTelemetryStore | None = None,
+    approval_store: SQLiteApprovalStore | None = None,
     api_token: str | None = None,
     api_user_id: str | None = None,
     api_agent_id: str | None = None,
+    approver_token: str | None = None,
 ) -> None:
     """
     Attach application-scoped governance dependencies.
@@ -42,6 +45,9 @@ def configure_app(
     if webhook_telemetry_store is not None:
         app.state.webhook_telemetry_store = webhook_telemetry_store
 
+    if approval_store is not None:
+        app.state.approval_store = approval_store
+
     if api_token is not None:
         app.state.api_token = api_token
 
@@ -50,6 +56,9 @@ def configure_app(
 
     if api_agent_id is not None:
         app.state.api_agent_id = api_agent_id
+
+    if approver_token is not None:
+        app.state.approver_token = approver_token
 
 
 def get_orchestrator(
@@ -228,10 +237,82 @@ def get_authenticated_principal(
     )
 
 
+def get_approval_store(
+    request: Request,
+) -> SQLiteApprovalStore:
+    store = getattr(
+        request.app.state,
+        "approval_store",
+        None,
+    )
+
+    if store is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Approval store is not configured",
+        )
+
+    return store
+
+
+def get_authenticated_approver(
+    request: Request,
+) -> AuthenticatedPrincipal:
+    authorization = request.headers.get("Authorization")
+
+    if authorization is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required",
+        )
+
+    scheme, separator, token = authorization.partition(" ")
+
+    if (
+        not separator
+        or scheme.lower() != "bearer"
+        or not token.strip()
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication credentials",
+        )
+
+    token = token.strip()
+    agent_token = getattr(request.app.state, "api_token", None)
+    approver_token = getattr(request.app.state, "approver_token", None)
+
+    # Security requirement: An agent CANNOT approve its own transaction.
+    # The approval endpoints MUST reject requests that present the agent token (403 Forbidden).
+    if agent_token and hmac.compare_digest(token, agent_token):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Agent token cannot approve transactions; approver token required",
+        )
+
+    if (
+        not isinstance(approver_token, str)
+        or not approver_token
+        or not hmac.compare_digest(token, approver_token)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid approver credentials",
+        )
+
+    user_id = getattr(request.app.state, "api_user_id", "admin")
+    return AuthenticatedPrincipal(
+        user_id=user_id,
+        agent_id="human_approver",
+    )
+
+
 __all__ = [
     "AuthenticatedPrincipal",
     "configure_app",
+    "get_approval_store",
     "get_audit_trail",
+    "get_authenticated_approver",
     "get_authenticated_principal",
     "get_orchestrator",
     "get_reconciliation_engine",
@@ -239,3 +320,4 @@ __all__ = [
     "get_webhook_handler",
     "get_webhook_telemetry_store",
 ]
+

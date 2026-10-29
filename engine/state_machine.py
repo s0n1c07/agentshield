@@ -33,13 +33,25 @@ class TransactionStateMachine:
             }
         ),
 
-        # Once policy is approved, the governed intent can be
-        # hashed and bound to a mandate.
+        # Once policy is approved, the governed intent can either move directly
+        # to MANDATE_VALID (if below approval threshold), or to PENDING_APPROVAL
         TransactionState.POLICY_APPROVED: frozenset(
             {
                 TransactionState.MANDATE_VALID,
+                TransactionState.PENDING_APPROVAL,
             }
         ),
+
+        TransactionState.PENDING_APPROVAL: frozenset(
+            {
+                TransactionState.MANDATE_VALID,
+                TransactionState.APPROVAL_REJECTED,
+                TransactionState.APPROVAL_EXPIRED,
+            }
+        ),
+
+        TransactionState.APPROVAL_REJECTED: frozenset(),
+        TransactionState.APPROVAL_EXPIRED: frozenset(),
 
         TransactionState.MANDATE_VALID: frozenset(
             {

@@ -106,6 +106,12 @@ class AgentAuthorization(BaseModel):
         description="Configurable timezone for calendar day and month spend windows.",
     )
 
+    approval_threshold_paise: StrictInt | None = Field(
+        default=None,
+        gt=0,
+        description="Optional transaction amount threshold requiring human approval.",
+    )
+
 
 class AuthorizationDecision(BaseModel):
     """
