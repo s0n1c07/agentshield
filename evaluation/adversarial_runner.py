@@ -312,6 +312,7 @@ async def run_scenario(
 ) -> AdversarialResult:
     with TemporaryDirectory(
         prefix="agentshield-adversarial-",
+        ignore_cleanup_errors=True,
     ) as temp:
         directory = Path(temp)
 

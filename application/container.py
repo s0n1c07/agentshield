@@ -208,11 +208,6 @@ class ApplicationContainer:
             else UnconfiguredPolicyProvider()
         )
 
-        mandate_secret_key = resolved_settings.mandate_secret_key
-
-        if isinstance(mandate_secret_key, str):
-            mandate_secret_key = mandate_secret_key.encode("utf-8")
-
         groq_client = Groq(
             api_key=resolved_settings.groq_api_key,
         )
@@ -230,8 +225,12 @@ class ApplicationContainer:
 
         intent_hasher = IntentHasher()
 
+        import json
+        keyring = json.loads(resolved_settings.mandate_verifying_keyring_json)
         mandate_engine = AP2AlignedMandateEngine(
-            mandate_secret_key,
+            signing_private_key=resolved_settings.mandate_signing_private_key_hex,
+            signing_kid=resolved_settings.mandate_signing_kid,
+            keyring=keyring,
             hasher=intent_hasher,
         )
 

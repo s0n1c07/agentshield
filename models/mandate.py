@@ -63,9 +63,20 @@ class Mandate(BaseModel):
         description="Time at which the mandate expires.",
     )
 
+    kid: StrictStr = Field(
+        min_length=1,
+        description="Key identifier for the public key used to verify the mandate.",
+    )
+
+    alg: StrictStr = Field(
+        default="EdDSA",
+        min_length=1,
+        description="Cryptographic algorithm used to sign the mandate.",
+    )
+
     signature: StrictStr = Field(
         min_length=1,
-        description="HMAC-SHA256 signature over the mandate payload.",
+        description="Hexadecimal Ed25519 signature over the mandate payload.",
     )
 
     @classmethod
